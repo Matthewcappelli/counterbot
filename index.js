@@ -11,10 +11,9 @@ const {
 
 const sqlite3 = require('sqlite3').verbose();
 
-// ===== DATABASE (Railway safe path)
+// ===== DATABASE
 const db = new sqlite3.Database('./data.sqlite');
 
-// Create tables
 db.serialize(() => {
   db.run(`
     CREATE TABLE IF NOT EXISTS config (
@@ -40,7 +39,7 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers]
 });
 
-// ===== SLASH COMMANDS
+// ===== COMMANDS
 const commands = [
   new SlashCommandBuilder().setName('setup').setDescription('Create counters'),
 
@@ -49,6 +48,30 @@ const commands = [
     .setDescription('Add role counter')
     .addRoleOption(opt =>
       opt.setName('role').setDescription('Role').setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName('create-counter')
+    .setDescription('Create a custom counter')
+    .addStringOption(opt =>
+      opt.setName('type')
+        .setDescription('Counter type')
+        .setRequired(true)
+        .addChoices(
+          { name: 'Members', value: 'members' },
+          { name: 'Bots', value: 'bots' },
+          { name: 'Role', value: 'role' }
+        )
+    )
+    .addRoleOption(opt =>
+      opt.setName('role')
+        .setDescription('Role (only for role counters)')
+        .setRequired(false)
+    )
+    .addStringOption(opt =>
+      opt.setName('name')
+        .setDescription('Channel name (use {count})')
+        .setRequired(true)
     ),
 
   new SlashCommandBuilder()
@@ -66,14 +89,14 @@ const commands = [
     )
     .addStringOption(opt =>
       opt.setName('name')
-        .setDescription('New name (use {count})')
+        .setDescription('New name (must include {count})')
         .setRequired(true)
     ),
 
   new SlashCommandBuilder().setName('update').setDescription('Update counters')
 ].map(c => c.toJSON());
 
-// ===== REGISTER COMMANDS (INSTANT)
+// ===== REGISTER COMMANDS
 const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
 
 (async () => {
@@ -98,7 +121,7 @@ client.once('ready', () => {
 
 // ===== HELPERS
 function getCategory(guildId) {
-  return new Promise((resolve) => {
+  return new Promise(resolve => {
     db.get(`SELECT categoryId FROM config WHERE guildId = ?`, [guildId], (err, row) => {
       resolve(row?.categoryId || null);
     });
@@ -106,7 +129,7 @@ function getCategory(guildId) {
 }
 
 function getCounters(guildId) {
-  return new Promise((resolve) => {
+  return new Promise(resolve => {
     db.all(`SELECT * FROM counters WHERE guildId = ?`, [guildId], (err, rows) => {
       resolve(rows || []);
     });
@@ -141,6 +164,7 @@ async function updateCounters(guild) {
 
     if (c.type === 'members') count = guild.memberCount;
     if (c.type === 'bots') count = guild.members.cache.filter(m => m.user.bot).size;
+
     if (c.type === 'role') {
       const role = guild.roles.cache.get(c.roleId);
       if (!role) continue;
@@ -148,7 +172,7 @@ async function updateCounters(guild) {
     }
 
     const newName = c.name.replace('{count}', count);
-    channel.setName(newName).catch(() => {});
+    await channel.setName(newName).catch(() => {});
   }
 }
 
@@ -169,9 +193,7 @@ client.on('interactionCreate', async (i) => {
       type: ChannelType.GuildCategory
     });
 
-    db.run(`INSERT OR REPLACE INTO config VALUES (?, ?)`,
-      [guild.id, category.id]
-    );
+    db.run(`INSERT OR REPLACE INTO config VALUES (?, ?)`, [guild.id, category.id]);
 
     const members = await createChannel(guild, category.id, '👥 Members: 0');
     const bots = await createChannel(guild, category.id, '🤖 Bots: 0');
@@ -184,7 +206,7 @@ client.on('interactionCreate', async (i) => {
       [guild.id, 'bots', null, bots.id, '🤖 Bots: {count}']
     );
 
-    i.reply('✅ Setup complete!');
+    await i.reply('✅ Setup complete!');
     updateCounters(guild);
   }
 
@@ -193,7 +215,7 @@ client.on('interactionCreate', async (i) => {
     const role = i.options.getRole('role');
     const categoryId = await getCategory(guild.id);
 
-    if (!categoryId) return i.reply('Run /setup first');
+    if (!categoryId) return i.reply({ content: '❌ Run /setup first', ephemeral: true });
 
     const ch = await createChannel(guild, categoryId, `🎭 ${role.name}: 0`);
 
@@ -201,7 +223,38 @@ client.on('interactionCreate', async (i) => {
       [guild.id, 'role', role.id, ch.id, `🎭 ${role.name}: {count}`]
     );
 
-    i.reply('✅ Role counter added');
+    await i.reply('✅ Role counter added');
+    updateCounters(guild);
+  }
+
+  // ===== CREATE COUNTER (NEW)
+  if (i.commandName === 'create-counter') {
+    const type = i.options.getString('type');
+    const role = i.options.getRole('role');
+    const name = i.options.getString('name');
+
+    if (!name.includes('{count}')) {
+      return i.reply({ content: '❌ Name must include {count}', ephemeral: true });
+    }
+
+    const categoryId = await getCategory(guild.id);
+    if (!categoryId) return i.reply({ content: '❌ Run /setup first', ephemeral: true });
+
+    if (type === 'role' && !role) {
+      return i.reply({ content: '❌ Role required for role counter', ephemeral: true });
+    }
+
+    const channel = await createChannel(
+      guild,
+      categoryId,
+      name.replace('{count}', '0')
+    );
+
+    db.run(`INSERT INTO counters (guildId,type,roleId,channelId,name) VALUES (?,?,?,?,?)`,
+      [guild.id, type, type === 'role' ? role.id : null, channel.id, name]
+    );
+
+    await i.reply('✅ Custom counter created!');
     updateCounters(guild);
   }
 
@@ -210,7 +263,7 @@ client.on('interactionCreate', async (i) => {
     const channel = i.options.getChannel('channel');
 
     db.run(`DELETE FROM counters WHERE channelId = ?`, [channel.id]);
-    channel.delete().catch(() => {});
+    await channel.delete().catch(() => {});
 
     i.reply('🗑️ Counter removed');
   }
@@ -220,12 +273,18 @@ client.on('interactionCreate', async (i) => {
     const channel = i.options.getChannel('channel');
     const name = i.options.getString('name');
 
+    if (!name.includes('{count}')) {
+      return i.reply({ content: '❌ Name must include {count}', ephemeral: true });
+    }
+
     db.run(`UPDATE counters SET name = ? WHERE channelId = ?`,
-      [name, channel.id]
+      [name, channel.id],
+      async () => {
+        await updateCounters(guild);
+      }
     );
 
     i.reply('✏️ Counter updated');
-    updateCounters(guild);
   }
 
   // ===== UPDATE
